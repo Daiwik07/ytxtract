@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "postinstall": "node scripts/download-ytdlp.js"
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",

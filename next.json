@@ -1,0 +1,11 @@
+{
+  "functions": {
+    "pages/api/download.js": {
+      "maxDuration": 60
+    }
+  },
+  "buildCommand": "npm run build",
+  "outputFileTracingIncludes": {
+    "pages/api/download.js": ["./bin/**"]
+  }
+}

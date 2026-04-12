@@ -13,6 +13,39 @@ export const config = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Build-time binary (downloaded by scripts/download-ytdlp.js at postinstall)
+// ---------------------------------------------------------------------------
+function getBuildTimeBinaryName() {
+  const { platform, arch } = process;
+  if (platform === "win32") return "yt-dlp.exe";
+  if (platform === "darwin") return "yt-dlp_macos";
+  if (platform === "linux") {
+    if (arch === "arm64") return "yt-dlp_linux_aarch64";
+    if (arch === "arm") return "yt-dlp_linux_armv7l";
+    return "yt-dlp_linux";
+  }
+  return "yt-dlp";
+}
+
+// Vercel serves files from the project root at runtime.
+const BUILD_TIME_BIN_PATH = path.join(
+  process.cwd(),
+  "bin",
+  getBuildTimeBinaryName()
+);
+
+function getBuildTimeBinary() {
+  try {
+    fs.accessSync(BUILD_TIME_BIN_PATH, fs.constants.X_OK);
+    return BUILD_TIME_BIN_PATH;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -301,29 +334,35 @@ function buildYtDlpFlags({ outputTemplate, normalizedFormat, quality, cookiePath
 }
 
 async function runYtDlp(url, flags) {
+  // 1. Prefer the binary bundled at build time (populated by postinstall script).
+  const buildBin = getBuildTimeBinary();
+  if (buildBin) {
+    console.log(`[ytgrab] Using build-time yt-dlp binary: ${buildBin}`);
+    const builtYtDlp = ytdlp.create(buildBin);
+    await builtYtDlp.exec(url, flags, { windowsHide: true, reject: true });
+    return;
+  }
+
+  // 2. Try the default yt-dlp-exec binary (works when Python is available).
   try {
-    await ytdlp.exec(url, flags, {
-      windowsHide: true,
-      reject: true,
-    });
+    await ytdlp.exec(url, flags, { windowsHide: true, reject: true });
     return;
   } catch (error) {
     if (!isMissingPythonError(error)) {
       throw error;
     }
+    console.warn("[ytgrab] Python not found; falling back to standalone yt-dlp download…");
+  }
 
-    const standalonePath = await ensureStandaloneYtDlpPath();
-    const standaloneYtDlp = ytdlp.create(standalonePath);
+  // 3. Last resort: download standalone binary at runtime into /tmp.
+  const standalonePath = await ensureStandaloneYtDlpPath();
+  const standaloneYtDlp = ytdlp.create(standalonePath);
 
-    try {
-      await standaloneYtDlp.exec(url, flags, {
-        windowsHide: true,
-        reject: true,
-      });
-    } catch (retryError) {
-      retryError.stderr = [retryError?.stderr, stringifyError(error)].filter(Boolean).join("\n");
-      throw retryError;
-    }
+  try {
+    await standaloneYtDlp.exec(url, flags, { windowsHide: true, reject: true });
+  } catch (retryError) {
+    retryError.stderr = [retryError?.stderr, stringifyError(retryError)].filter(Boolean).join("\n");
+    throw retryError;
   }
 }
 
