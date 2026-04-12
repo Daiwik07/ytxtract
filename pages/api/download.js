@@ -6,6 +6,8 @@ import path from "node:path";
 import ytdlp from "yt-dlp-exec";
 
 export const config = {
+  runtime: "nodejs",
+  maxDuration: 60,
   api: {
     responseLimit: false,
   },
@@ -55,6 +57,20 @@ function parseCookieJson(raw) {
 }
 
 async function readCookieSource() {
+  const envBase64 = process.env.YTDL_COOKIES_B64;
+  if (envBase64) {
+    try {
+      const decoded = Buffer.from(envBase64, "base64").toString("utf8");
+      const cookies = parseCookieJson(decoded);
+      if (cookies) {
+        return { type: "json", cookies };
+      }
+      console.warn("Invalid YTDL_COOKIES_B64 payload.");
+    } catch {
+      console.warn("Failed to decode YTDL_COOKIES_B64.");
+    }
+  }
+
   const envRaw = process.env.YTDL_COOKIES || process.env.YT_COOKIES;
   if (envRaw) {
     const cookies = parseCookieJson(envRaw);
@@ -69,13 +85,17 @@ async function readCookieSource() {
     return null;
   }
 
+  const resolvedPath = path.isAbsolute(cookiePath)
+    ? cookiePath
+    : path.join(process.cwd(), cookiePath);
+
   try {
-    const content = await fsPromises.readFile(cookiePath, "utf8");
+    const content = await fsPromises.readFile(resolvedPath, "utf8");
     const cookies = parseCookieJson(content);
     if (cookies) {
       return { type: "json", cookies };
     }
-    return { type: "netscape-file", cookiePath };
+    return { type: "netscape-file", cookiePath: resolvedPath };
   } catch (error) {
     console.warn("Failed to read YTDL_COOKIES_PATH", error?.message || error);
     return null;
@@ -267,6 +287,37 @@ function classifyYtDlpError(error) {
     .filter(Boolean)
     .join("\n");
   const normalized = raw.toLowerCase();
+
+  if (
+    normalized.includes("enoent") &&
+    (normalized.includes("yt-dlp") || normalized.includes("spawn"))
+  ) {
+    return {
+      status: 500,
+      message: "yt-dlp binary is unavailable in this deployment. Redeploy and verify install logs.",
+    };
+  }
+
+  if (normalized.includes("permission denied") && (normalized.includes("yt-dlp") || normalized.includes("ffmpeg"))) {
+    return {
+      status: 500,
+      message: "Execution permission error for yt-dlp/ffmpeg in server runtime.",
+    };
+  }
+
+  if (normalized.includes("no space left on device") || normalized.includes("enospc")) {
+    return {
+      status: 507,
+      message: "Server temporary storage is full. Try a lower quality or shorter video.",
+    };
+  }
+
+  if (normalized.includes("timed out") || normalized.includes("function invocation timeout")) {
+    return {
+      status: 504,
+      message: "Download timed out on server. Try lower quality or shorter video.",
+    };
+  }
 
   if (
     normalized.includes("http error 403") ||
