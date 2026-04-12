@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * Downloads the correct yt-dlp standalone binary for the current platform
- * into ./bin/ so Vercel (and other serverless runtimes without Python) can
- * use it directly without a runtime network call.
+ * into ./bin/ at install time so Vercel (no Python) can use it directly.
  *
- * Run automatically via the "postinstall" npm hook.
+ * This script is intentionally non-fatal: if the download fails for any
+ * reason the script exits 0 so `npm install` always succeeds.
  */
 
 const https = require("https");
@@ -27,8 +27,9 @@ function getBinaryName() {
   return "yt-dlp";
 }
 
-function download(url, dest, redirects = 0) {
-  return new Promise((resolve, reject) => {
+function download(url, dest, redirects) {
+  redirects = redirects || 0;
+  return new Promise(function (resolve, reject) {
     if (redirects > 10) {
       return reject(new Error("Too many redirects"));
     }
@@ -36,20 +37,30 @@ function download(url, dest, redirects = 0) {
     const proto = url.startsWith("https") ? https : http;
 
     proto
-      .get(url, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+      .get(url, function (res) {
+        if (
+          res.statusCode >= 300 &&
+          res.statusCode < 400 &&
+          res.headers.location
+        ) {
           return resolve(download(res.headers.location, dest, redirects + 1));
         }
 
         if (res.statusCode !== 200) {
-          return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+          res.resume(); // drain so socket is released
+          return reject(new Error("HTTP " + res.statusCode + " for " + url));
         }
 
         const file = fs.createWriteStream(dest);
         res.pipe(file);
-        file.on("finish", () => file.close(resolve));
-        file.on("error", (err) => {
-          fs.unlink(dest, () => {});
+        file.on("finish", function () {
+          file.close(function (closeErr) {
+            if (closeErr) reject(closeErr);
+            else resolve();
+          });
+        });
+        file.on("error", function (err) {
+          try { fs.unlinkSync(dest); } catch (_) {}
           reject(err);
         });
       })
@@ -59,19 +70,24 @@ function download(url, dest, redirects = 0) {
 
 async function main() {
   const binDir = path.join(__dirname, "..", "bin");
-  fs.mkdirSync(binDir, { recursive: true });
+
+  try {
+    fs.mkdirSync(binDir, { recursive: true });
+  } catch (err) {
+    console.warn("[download-ytdlp] Could not create bin/ dir:", err.message);
+    return; // non-fatal
+  }
 
   const binaryName = getBinaryName();
   const destPath = path.join(binDir, binaryName);
 
-  // Skip if already present (e.g. local dev re-installs)
   if (fs.existsSync(destPath)) {
-    console.log(`[download-ytdlp] Binary already exists at ${destPath}, skipping.`);
+    console.log("[download-ytdlp] Binary already exists at " + destPath + ", skipping.");
     return;
   }
 
   const url = RELEASE_BASE + binaryName;
-  console.log(`[download-ytdlp] Downloading ${url} → ${destPath}`);
+  console.log("[download-ytdlp] Downloading " + url + " → " + destPath);
 
   try {
     await download(url, destPath);
@@ -82,10 +98,15 @@ async function main() {
 
     console.log("[download-ytdlp] Done.");
   } catch (err) {
-    // Non-fatal: the API will fall back to the runtime download approach.
-    console.warn(`[download-ytdlp] WARNING: Could not download yt-dlp binary: ${err.message}`);
+    try { fs.unlinkSync(destPath); } catch (_) {}
+    console.warn("[download-ytdlp] WARNING: Could not download yt-dlp binary:", err.message);
     console.warn("[download-ytdlp] The API will attempt a runtime download as a fallback.");
+    // Do NOT re-throw — npm install must not fail.
   }
 }
 
-main();
+// Top-level catch: process always exits 0 regardless of what happens.
+main().catch(function (err) {
+  console.warn("[download-ytdlp] Unexpected error:", err.message);
+  process.exit(0);
+});
