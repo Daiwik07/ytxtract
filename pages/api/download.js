@@ -28,6 +28,85 @@ const MIME_BY_EXT = {
 };
 
 const AUDIO_FORMATS = new Set(["MP3", "AAC", "WAV", "FLAC"]);
+let standaloneYtDlpPathPromise = null;
+
+function stringifyError(error) {
+  return [error?.stderr, error?.shortMessage, error?.message].filter(Boolean).join("\n");
+}
+
+function isMissingPythonError(error) {
+  const normalized = stringifyError(error).toLowerCase();
+  return normalized.includes("python3") && normalized.includes("no such file or directory");
+}
+
+function getStandaloneAssetName() {
+  if (process.platform === "win32") {
+    return "yt-dlp.exe";
+  }
+
+  if (process.platform === "darwin") {
+    return "yt-dlp_macos";
+  }
+
+  if (process.platform === "linux") {
+    if (process.arch === "arm64") {
+      return "yt-dlp_linux_aarch64";
+    }
+    if (process.arch === "arm") {
+      return "yt-dlp_linux_armv7l";
+    }
+    return "yt-dlp_linux";
+  }
+
+  return "yt-dlp";
+}
+
+function getStandaloneAssetUrl() {
+  const customUrl = String(process.env.YTDLP_STANDALONE_URL || "").trim();
+  if (customUrl) {
+    return customUrl;
+  }
+
+  return `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${getStandaloneAssetName()}`;
+}
+
+async function ensureStandaloneYtDlpPath() {
+  if (!standaloneYtDlpPathPromise) {
+    standaloneYtDlpPathPromise = (async () => {
+      const binDir = path.join(os.tmpdir(), "ytgrab-bin");
+      const binaryName = process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp";
+      const binaryPath = path.join(binDir, binaryName);
+
+      try {
+        await fsPromises.access(binaryPath, fs.constants.X_OK);
+        return binaryPath;
+      } catch {
+        // Keep going and download a standalone binary.
+      }
+
+      await fsPromises.mkdir(binDir, { recursive: true });
+      const response = await fetch(getStandaloneAssetUrl());
+
+      if (!response.ok) {
+        throw new Error(`Failed to download standalone yt-dlp (${response.status})`);
+      }
+
+      const payload = Buffer.from(await response.arrayBuffer());
+      await fsPromises.writeFile(binaryPath, payload, { mode: 0o755 });
+
+      if (process.platform !== "win32") {
+        await fsPromises.chmod(binaryPath, 0o755);
+      }
+
+      return binaryPath;
+    })().catch((error) => {
+      standaloneYtDlpPathPromise = null;
+      throw error;
+    });
+  }
+
+  return standaloneYtDlpPathPromise;
+}
 
 function normalizeUrl(value) {
   const raw = String(value || "").trim();
@@ -222,10 +301,30 @@ function buildYtDlpFlags({ outputTemplate, normalizedFormat, quality, cookiePath
 }
 
 async function runYtDlp(url, flags) {
-  await ytdlp.exec(url, flags, {
-    windowsHide: true,
-    reject: true,
-  });
+  try {
+    await ytdlp.exec(url, flags, {
+      windowsHide: true,
+      reject: true,
+    });
+    return;
+  } catch (error) {
+    if (!isMissingPythonError(error)) {
+      throw error;
+    }
+
+    const standalonePath = await ensureStandaloneYtDlpPath();
+    const standaloneYtDlp = ytdlp.create(standalonePath);
+
+    try {
+      await standaloneYtDlp.exec(url, flags, {
+        windowsHide: true,
+        reject: true,
+      });
+    } catch (retryError) {
+      retryError.stderr = [retryError?.stderr, stringifyError(error)].filter(Boolean).join("\n");
+      throw retryError;
+    }
+  }
 }
 
 async function findOutputFile(tempDir) {
@@ -283,10 +382,22 @@ async function streamFileToResponse(filePath, res) {
 }
 
 function classifyYtDlpError(error) {
-  const raw = [error?.stderr, error?.shortMessage, error?.message]
-    .filter(Boolean)
-    .join("\n");
+  const raw = stringifyError(error);
   const normalized = raw.toLowerCase();
+
+  if (normalized.includes("failed to download standalone yt-dlp")) {
+    return {
+      status: 500,
+      message: "Server failed to fetch standalone yt-dlp binary. Check network access during function runtime.",
+    };
+  }
+
+  if (normalized.includes("python3") && normalized.includes("no such file or directory")) {
+    return {
+      status: 500,
+      message: "Server runtime is missing Python and standalone yt-dlp fallback did not complete.",
+    };
+  }
 
   if (
     normalized.includes("enoent") &&
