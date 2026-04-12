@@ -296,10 +296,21 @@ function mapQualityToHeight(quality) {
 function buildVideoSelector(quality) {
   const maxHeight = mapQualityToHeight(quality);
   if (!maxHeight) {
-    return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best";
+    return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best";
   }
 
-  return `bestvideo[ext=mp4][height<=${maxHeight}]+bestaudio[ext=m4a]/best[ext=mp4][height<=${maxHeight}]/bestvideo[height<=${maxHeight}]+bestaudio/best[height<=${maxHeight}]/best`;
+  // Try preferred quality first, then progressively relax so we always
+  // get something rather than failing with "format not available".
+  return [
+    `bestvideo[ext=mp4][height<=${maxHeight}]+bestaudio[ext=m4a]`,
+    `bestvideo[height<=${maxHeight}]+bestaudio`,
+    `best[ext=mp4][height<=${maxHeight}]`,
+    `best[height<=${maxHeight}]`,
+    `bestvideo[ext=mp4]+bestaudio[ext=m4a]`,
+    `bestvideo+bestaudio`,
+    `best[ext=mp4]`,
+    `best`,
+  ].join("/");
 }
 
 function buildYtDlpFlags({ outputTemplate, normalizedFormat, quality, cookiePath }) {
