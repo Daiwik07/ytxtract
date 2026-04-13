@@ -117,13 +117,34 @@ function isNetscapeFormat(text) {
   return (
     text.includes("# Netscape HTTP Cookie File") ||
     text.includes("# HTTP Cookie File") ||
-    // Tab-separated lines with domain = Netscape format
     text.split("\n").some((line) => {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith("#")) return false;
       return trimmed.split("\t").length >= 6;
     })
   );
+}
+
+// BOM, CRLF, CR sab clean karo — yt-dlp strict hai
+function cleanNetscapeContent(content) {
+  const cleaned = content
+    .replace(/^\uFEFF/, "")      // UTF-8 BOM remove
+    .replace(/\r\n/g, "\n")      // Windows CRLF → LF
+    .replace(/\r/g, "\n")        // old Mac CR → LF
+    .trim();
+
+  // Some exporters omit the header; yt-dlp expects Netscape header.
+  if (!cleaned) return "# Netscape HTTP Cookie File\n";
+  if (cleaned.startsWith("# Netscape HTTP Cookie File") || cleaned.startsWith("# HTTP Cookie File")) {
+    return cleaned;
+  }
+  return `# Netscape HTTP Cookie File\n${cleaned}`;
+}
+
+function resolveCookiePath(cookiePath) {
+  const raw = String(cookiePath || "").trim();
+  if (!raw) return "";
+  return path.isAbsolute(raw) ? raw : path.join(process.cwd(), raw);
 }
 
 async function readCookieSource() {
@@ -133,20 +154,20 @@ async function readCookieSource() {
     try {
       const decoded = Buffer.from(envBase64, "base64").toString("utf8");
 
-      // Try JSON array first (cookie-editor extension format)
+      // JSON array format (Cookie-Editor extension)
       const cookies = parseCookieJson(decoded);
       if (cookies) {
         console.log("[ytgrab] Cookies loaded from YTDL_COOKIES_B64 (JSON format)");
         return { type: "json", cookies };
       }
 
-      // Try Netscape format (cookies.txt export format)
+      // Netscape format (cookies.txt export)
       if (isNetscapeFormat(decoded)) {
         console.log("[ytgrab] Cookies loaded from YTDL_COOKIES_B64 (Netscape format)");
         return { type: "netscape-raw", content: decoded };
       }
 
-      console.warn("[ytgrab] Invalid YTDL_COOKIES_B64 payload — not JSON or Netscape format.");
+      console.warn("[ytgrab] Invalid YTDL_COOKIES_B64 — not JSON or Netscape format.");
     } catch {
       console.warn("[ytgrab] Failed to decode YTDL_COOKIES_B64.");
     }
@@ -155,11 +176,31 @@ async function readCookieSource() {
   // 2. Raw JSON env var
   const envRaw = process.env.YTDL_COOKIES || process.env.YT_COOKIES;
   if (envRaw) {
-    const cookies = parseCookieJson(envRaw);
+    const rawValue = String(envRaw).trim();
+    const cookies = parseCookieJson(rawValue);
     if (cookies) {
       console.log("[ytgrab] Cookies loaded from YTDL_COOKIES env var");
       return { type: "json", cookies };
     }
+
+    // Backward compatibility: allow Netscape cookies directly in YTDL_COOKIES.
+    if (isNetscapeFormat(rawValue)) {
+      console.log("[ytgrab] Cookies loaded from YTDL_COOKIES env var (Netscape format)");
+      return { type: "netscape-raw", content: rawValue };
+    }
+
+    // Backward compatibility: some setups put a file path in YTDL_COOKIES.
+    const legacyCookiePath = resolveCookiePath(rawValue);
+    if (legacyCookiePath) {
+      try {
+        await fsPromises.access(legacyCookiePath, fs.constants.R_OK);
+        console.log("[ytgrab] YTDL_COOKIES treated as cookie file path; prefer YTDL_COOKIES_PATH");
+        return { type: "netscape-file", cookiePath: legacyCookiePath };
+      } catch {
+        // Fall through to warning below.
+      }
+    }
+
     console.warn("[ytgrab] Invalid YTDL_COOKIES JSON.");
   }
 
@@ -167,8 +208,7 @@ async function readCookieSource() {
   const cookiePath = process.env.YTDL_COOKIES_PATH;
   if (!cookiePath) return null;
 
-  const resolvedPath = path.isAbsolute(cookiePath)
-    ? cookiePath : path.join(process.cwd(), cookiePath);
+  const resolvedPath = resolveCookiePath(cookiePath);
 
   try {
     const content = await fsPromises.readFile(resolvedPath, "utf8");
@@ -206,26 +246,32 @@ function toNetscapeCookieFile(cookies) {
 async function prepareCookieFile(tempDir) {
   const source = await readCookieSource();
   if (!source) {
-    console.warn("[ytgrab] No cookies found — downloads may fail on Vercel.");
+    console.warn("[ytgrab] No cookies found — downloads may fail.");
     return null;
   }
 
   const targetPath = path.join(tempDir, "cookies.txt");
 
   if (source.type === "netscape-file") {
-    return source.cookiePath;
-  }
-
-  if (source.type === "netscape-raw") {
-    await fsPromises.writeFile(targetPath, source.content, "utf8");
+    // File se read karke clean karke likho
+    const raw = await fsPromises.readFile(source.cookiePath, "utf8");
+    await fsPromises.writeFile(targetPath, cleanNetscapeContent(raw), "utf8");
     return targetPath;
   }
 
-  // JSON array — convert to Netscape format
+  if (source.type === "netscape-raw") {
+    // Clean karke likho — BOM aur CRLF hata do
+    await fsPromises.writeFile(targetPath, cleanNetscapeContent(source.content), "utf8");
+    return targetPath;
+  }
+
+  // JSON array — Netscape format mein convert karo
   await fsPromises.writeFile(targetPath, toNetscapeCookieFile(source.cookies), "utf8");
   return targetPath;
+  
 }
 
+  // ... baaki code same
 // ---------------------------------------------------------------------------
 // Format selection
 // ---------------------------------------------------------------------------
@@ -273,7 +319,6 @@ function buildYtDlpFlags({ outputTemplate, normalizedFormat, quality, cookiePath
     forceOverwrites: true,
     output: outputTemplate,
     userAgent: DEFAULT_USER_AGENT,
-    // Use multiple player clients so formats are always available
     extractorArgs: "youtube:player_client=web,default,ios",
   };
 
@@ -378,6 +423,8 @@ function classifyError(err) {
 
   if (s.includes("sign in to confirm") || s.includes("confirm you're not a bot"))
     return { status: 403, message: "YouTube requires authentication. Set valid cookies via YTDL_COOKIES_B64." };
+  if (s.includes("does not look like a netscape"))
+    return { status: 500, message: "Cookie file format invalid. Re-export cookies and try again." };
   if (s.includes("429") || s.includes("rate limit"))
     return { status: 429, message: "YouTube is rate-limiting this server. Try again later." };
   if (s.includes("requested format is not available"))
@@ -401,6 +448,7 @@ function classifyError(err) {
 async function safeRm(p) {
   try { await fsPromises.rm(p, { recursive: true, force: true }); } catch { /* ignore */ }
 }
+
 
 // ---------------------------------------------------------------------------
 // Main handler
