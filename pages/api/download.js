@@ -226,7 +226,7 @@ function buildYtDlpFlags({ outputTemplate, normalizedFormat, quality, cookiePath
     // Force the web player so all formats are available.
     // Without this, cookies can cause yt-dlp to use the TV/Android client
     // which has fewer formats and causes "format not available" errors.
-    extractorArgs: "youtube:player_client=web",
+    extractorArgs: "youtube:player_client=web,default,ios",
   };
 
   if (cookiePath) base.cookies = cookiePath;
