@@ -27,6 +27,13 @@ const MIME_BY_EXT = {
 
 const AUDIO_FORMATS = new Set(["MP3", "AAC", "WAV", "FLAC"]);
 
+const YOUTUBE_EXTRACTOR_PROFILES = [
+  "youtube:player_client=web,default,ios",
+  "youtube:player_client=android,ios",
+  "youtube:player_client=tv,ios,android",
+  "youtube:player_client=android,ios;player_skip=webpage,configs",
+];
+
 // ---------------------------------------------------------------------------
 // Build-time binary
 // ---------------------------------------------------------------------------
@@ -319,7 +326,7 @@ function buildYtDlpFlags({ outputTemplate, normalizedFormat, quality, cookiePath
     forceOverwrites: true,
     output: outputTemplate,
     userAgent: DEFAULT_USER_AGENT,
-    extractorArgs: "youtube:player_client=web,default,ios",
+    extractorArgs: YOUTUBE_EXTRACTOR_PROFILES[0],
   };
 
   if (cookiePath) base.cookies = cookiePath;
@@ -350,7 +357,19 @@ function isMissingPythonError(err) {
   return s.includes("python3") && s.includes("no such file or directory");
 }
 
-async function runYtDlp(url, flags) {
+function isBotChallengeError(err) {
+  const s = stringifyError(err).toLowerCase();
+  return s.includes("sign in to confirm") || s.includes("confirm you're not a bot") || s.includes("confirm you’re not a bot");
+}
+
+async function execWithSelectedBinary(url, flags, { forceStandalone = false } = {}) {
+  if (forceStandalone) {
+    const standalonePath = await ensureStandaloneYtDlpPath();
+    console.log(`[ytgrab] Using runtime standalone binary: ${standalonePath}`);
+    await ytdlp.create(standalonePath).exec(url, flags, { windowsHide: true, reject: true });
+    return;
+  }
+
   // 1. Build-time binary (Vercel deployment)
   const buildBin = getBuildTimeBinary();
   if (buildBin) {
@@ -370,12 +389,48 @@ async function runYtDlp(url, flags) {
 
   // 3. Runtime download fallback
   const standalonePath = await ensureStandaloneYtDlpPath();
-  try {
-    await ytdlp.create(standalonePath).exec(url, flags, { windowsHide: true, reject: true });
-  } catch (retryErr) {
-    retryErr.stderr = [retryErr?.stderr, stringifyError(retryErr)].filter(Boolean).join("\n");
-    throw retryErr;
+  await ytdlp.create(standalonePath).exec(url, flags, { windowsHide: true, reject: true });
+}
+
+async function runYtDlp(url, flags) {
+  const profileOrder = [
+    flags.extractorArgs,
+    ...YOUTUBE_EXTRACTOR_PROFILES.filter((p) => p !== flags.extractorArgs),
+  ];
+
+  const tryProfiles = async ({ forceStandalone = false } = {}) => {
+    let lastErr = null;
+
+    for (let i = 0; i < profileOrder.length; i += 1) {
+      const extractorArgs = profileOrder[i];
+      const attemptFlags = { ...flags, extractorArgs };
+
+      try {
+        await execWithSelectedBinary(url, attemptFlags, { forceStandalone });
+        return null;
+      } catch (err) {
+        lastErr = err;
+        if (!isBotChallengeError(err) || i === profileOrder.length - 1) {
+          return err;
+        }
+        console.warn(`[ytgrab] Bot challenge with profile '${extractorArgs}', retrying...`);
+      }
+    }
+
+    return lastErr;
+  };
+
+  let err = await tryProfiles();
+  if (!err) return;
+
+  if (isBotChallengeError(err)) {
+    console.warn("[ytgrab] Retrying bot challenge with runtime standalone binary...");
+    err = await tryProfiles({ forceStandalone: true });
+    if (!err) return;
   }
+
+  err.stderr = [err?.stderr, stringifyError(err)].filter(Boolean).join("\n");
+  throw err;
 }
 
 // ---------------------------------------------------------------------------
@@ -421,8 +476,8 @@ async function streamFileToResponse(filePath, res) {
 function classifyError(err) {
   const s = stringifyError(err).toLowerCase();
 
-  if (s.includes("sign in to confirm") || s.includes("confirm you're not a bot"))
-    return { status: 403, message: "YouTube requires authentication. Set valid cookies via YTDL_COOKIES_B64." };
+  if (isBotChallengeError(err))
+    return { status: 403, message: "YouTube bot-check blocked this request. Re-export fresh YouTube cookies from a logged-in browser session and try again." };
   if (s.includes("does not look like a netscape"))
     return { status: 500, message: "Cookie file format invalid. Re-export cookies and try again." };
   if (s.includes("429") || s.includes("rate limit"))
