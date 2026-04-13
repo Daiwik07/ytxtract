@@ -43,3 +43,7 @@ next-env.d.ts
 cookies.json
 
 .env.local
+
+bin
+cookies_b64.txt
+www.youtube.com_cookies.txt
