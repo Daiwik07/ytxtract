@@ -34,6 +34,22 @@ const YOUTUBE_EXTRACTOR_PROFILES = [
   "youtube:player_client=android,ios;player_skip=webpage,configs",
 ];
 
+function getExtractorProfiles() {
+  const raw = String(process.env.YTDL_EXTRACTOR_PROFILES || "").trim();
+  if (!raw) return YOUTUBE_EXTRACTOR_PROFILES;
+
+  const parsed = raw
+    .split("|")
+    .map((v) => v.trim())
+    .filter(Boolean);
+
+  return parsed.length ? parsed : YOUTUBE_EXTRACTOR_PROFILES;
+}
+
+function getProxyUrl() {
+  return String(process.env.YTDL_PROXY_URL || process.env.YTDL_PROXY || "").trim();
+}
+
 // ---------------------------------------------------------------------------
 // Build-time binary
 // ---------------------------------------------------------------------------
@@ -319,6 +335,9 @@ function buildVideoSelector(quality) {
 // ---------------------------------------------------------------------------
 
 function buildYtDlpFlags({ outputTemplate, normalizedFormat, quality, cookiePath }) {
+  const extractorProfiles = getExtractorProfiles();
+  const proxyUrl = getProxyUrl();
+
   const base = {
     noPlaylist: true,
     noWarnings: true,
@@ -326,10 +345,11 @@ function buildYtDlpFlags({ outputTemplate, normalizedFormat, quality, cookiePath
     forceOverwrites: true,
     output: outputTemplate,
     userAgent: DEFAULT_USER_AGENT,
-    extractorArgs: YOUTUBE_EXTRACTOR_PROFILES[0],
+    extractorArgs: extractorProfiles[0],
   };
 
   if (cookiePath) base.cookies = cookiePath;
+  if (proxyUrl) base.proxy = proxyUrl;
 
   if (AUDIO_FORMATS.has(normalizedFormat)) {
     return {
@@ -360,6 +380,10 @@ function isMissingPythonError(err) {
 function isBotChallengeError(err) {
   const s = stringifyError(err).toLowerCase();
   return s.includes("sign in to confirm") || s.includes("confirm you're not a bot") || s.includes("confirm you’re not a bot");
+}
+
+function isFormatUnavailableError(err) {
+  return stringifyError(err).toLowerCase().includes("requested format is not available");
 }
 
 async function execWithSelectedBinary(url, flags, { forceStandalone = false } = {}) {
@@ -393,39 +417,55 @@ async function execWithSelectedBinary(url, flags, { forceStandalone = false } = 
 }
 
 async function runYtDlp(url, flags) {
+  const configuredProfiles = getExtractorProfiles();
+
   const profileOrder = [
     flags.extractorArgs,
-    ...YOUTUBE_EXTRACTOR_PROFILES.filter((p) => p !== flags.extractorArgs),
+    ...configuredProfiles.filter((p) => p !== flags.extractorArgs),
   ];
 
-  const tryProfiles = async ({ forceStandalone = false } = {}) => {
+  const tryProfiles = async (baseFlags, { forceStandalone = false, retryOnFormat = false } = {}) => {
     let lastErr = null;
 
     for (let i = 0; i < profileOrder.length; i += 1) {
       const extractorArgs = profileOrder[i];
-      const attemptFlags = { ...flags, extractorArgs };
+      const attemptFlags = { ...baseFlags, extractorArgs };
 
       try {
         await execWithSelectedBinary(url, attemptFlags, { forceStandalone });
         return null;
       } catch (err) {
         lastErr = err;
-        if (!isBotChallengeError(err) || i === profileOrder.length - 1) {
+        const shouldRetryForBot = isBotChallengeError(err);
+        const shouldRetryForFormat = retryOnFormat && isFormatUnavailableError(err);
+        if ((!shouldRetryForBot && !shouldRetryForFormat) || i === profileOrder.length - 1) {
           return err;
         }
-        console.warn(`[ytgrab] Bot challenge with profile '${extractorArgs}', retrying...`);
+        if (shouldRetryForBot) {
+          console.warn(`[ytgrab] Bot challenge with profile '${extractorArgs}', retrying...`);
+        } else {
+          console.warn(`[ytgrab] Format not available with profile '${extractorArgs}', retrying...`);
+        }
       }
     }
 
     return lastErr;
   };
 
-  let err = await tryProfiles();
+  let err = await tryProfiles(flags, { retryOnFormat: true });
   if (!err) return;
+
+  if (isFormatUnavailableError(err) && !flags.extractAudio) {
+    const relaxedFlags = { ...flags, format: "bestvideo+bestaudio/best" };
+    delete relaxedFlags.mergeOutputFormat;
+    console.warn("[ytgrab] Requested format not available; retrying with a generic format...");
+    err = await tryProfiles(relaxedFlags, { retryOnFormat: true });
+    if (!err) return;
+  }
 
   if (isBotChallengeError(err)) {
     console.warn("[ytgrab] Retrying bot challenge with runtime standalone binary...");
-    err = await tryProfiles({ forceStandalone: true });
+    err = await tryProfiles(flags, { forceStandalone: true, retryOnFormat: true });
     if (!err) return;
   }
 
@@ -477,7 +517,7 @@ function classifyError(err) {
   const s = stringifyError(err).toLowerCase();
 
   if (isBotChallengeError(err))
-    return { status: 403, message: "YouTube bot-check blocked this request. Re-export fresh YouTube cookies from a logged-in browser session and try again." };
+    return { status: 403, message: "YouTube bot-check blocked this request (server IP reputation). Re-export fresh cookies and set YTDL_PROXY_URL to a residential proxy." };
   if (s.includes("does not look like a netscape"))
     return { status: 500, message: "Cookie file format invalid. Re-export cookies and try again." };
   if (s.includes("429") || s.includes("rate limit"))
@@ -528,6 +568,10 @@ export default async function handler(req, res) {
     const cookiePath = await prepareCookieFile(tempDir);
     const outputTemplate = path.join(tempDir, "download.%(ext)s");
     const flags = buildYtDlpFlags({ outputTemplate, normalizedFormat, quality, cookiePath });
+
+    if (flags.proxy) {
+      console.log("[ytgrab] Outbound proxy enabled for yt-dlp requests");
+    }
 
     await runYtDlp(normalizedUrl, flags);
 
