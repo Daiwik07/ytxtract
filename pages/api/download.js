@@ -11,10 +11,6 @@ export const config = {
   api: { responseLimit: false },
 };
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -32,7 +28,7 @@ const MIME_BY_EXT = {
 const AUDIO_FORMATS = new Set(["MP3", "AAC", "WAV", "FLAC"]);
 
 // ---------------------------------------------------------------------------
-// Build-time binary (placed by scripts/download-ytdlp.js at postinstall)
+// Build-time binary
 // ---------------------------------------------------------------------------
 
 function getBuildTimeBinaryName() {
@@ -117,21 +113,57 @@ function parseCookieJson(raw) {
   catch { return null; }
 }
 
+function isNetscapeFormat(text) {
+  return (
+    text.includes("# Netscape HTTP Cookie File") ||
+    text.includes("# HTTP Cookie File") ||
+    // Tab-separated lines with domain = Netscape format
+    text.split("\n").some((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) return false;
+      return trimmed.split("\t").length >= 6;
+    })
+  );
+}
+
 async function readCookieSource() {
+  // 1. Base64 encoded env var
   const envBase64 = process.env.YTDL_COOKIES_B64;
   if (envBase64) {
     try {
-      const cookies = parseCookieJson(Buffer.from(envBase64, "base64").toString("utf8"));
-      if (cookies) return { type: "json", cookies };
-    } catch { console.warn("[ytgrab] Failed to decode YTDL_COOKIES_B64."); }
+      const decoded = Buffer.from(envBase64, "base64").toString("utf8");
+
+      // Try JSON array first (cookie-editor extension format)
+      const cookies = parseCookieJson(decoded);
+      if (cookies) {
+        console.log("[ytgrab] Cookies loaded from YTDL_COOKIES_B64 (JSON format)");
+        return { type: "json", cookies };
+      }
+
+      // Try Netscape format (cookies.txt export format)
+      if (isNetscapeFormat(decoded)) {
+        console.log("[ytgrab] Cookies loaded from YTDL_COOKIES_B64 (Netscape format)");
+        return { type: "netscape-raw", content: decoded };
+      }
+
+      console.warn("[ytgrab] Invalid YTDL_COOKIES_B64 payload — not JSON or Netscape format.");
+    } catch {
+      console.warn("[ytgrab] Failed to decode YTDL_COOKIES_B64.");
+    }
   }
 
+  // 2. Raw JSON env var
   const envRaw = process.env.YTDL_COOKIES || process.env.YT_COOKIES;
   if (envRaw) {
     const cookies = parseCookieJson(envRaw);
-    if (cookies) return { type: "json", cookies };
+    if (cookies) {
+      console.log("[ytgrab] Cookies loaded from YTDL_COOKIES env var");
+      return { type: "json", cookies };
+    }
+    console.warn("[ytgrab] Invalid YTDL_COOKIES JSON.");
   }
 
+  // 3. Path to cookies file
   const cookiePath = process.env.YTDL_COOKIES_PATH;
   if (!cookiePath) return null;
 
@@ -141,7 +173,11 @@ async function readCookieSource() {
   try {
     const content = await fsPromises.readFile(resolvedPath, "utf8");
     const cookies = parseCookieJson(content);
-    if (cookies) return { type: "json", cookies };
+    if (cookies) {
+      console.log("[ytgrab] Cookies loaded from file (JSON format)");
+      return { type: "json", cookies };
+    }
+    console.log("[ytgrab] Cookies loaded from file (Netscape format)");
     return { type: "netscape-file", cookiePath: resolvedPath };
   } catch (err) {
     console.warn("[ytgrab] Failed to read YTDL_COOKIES_PATH:", err?.message);
@@ -169,9 +205,23 @@ function toNetscapeCookieFile(cookies) {
 
 async function prepareCookieFile(tempDir) {
   const source = await readCookieSource();
-  if (!source) return null;
-  if (source.type === "netscape-file") return source.cookiePath;
+  if (!source) {
+    console.warn("[ytgrab] No cookies found — downloads may fail on Vercel.");
+    return null;
+  }
+
   const targetPath = path.join(tempDir, "cookies.txt");
+
+  if (source.type === "netscape-file") {
+    return source.cookiePath;
+  }
+
+  if (source.type === "netscape-raw") {
+    await fsPromises.writeFile(targetPath, source.content, "utf8");
+    return targetPath;
+  }
+
+  // JSON array — convert to Netscape format
   await fsPromises.writeFile(targetPath, toNetscapeCookieFile(source.cookies), "utf8");
   return targetPath;
 }
@@ -223,9 +273,7 @@ function buildYtDlpFlags({ outputTemplate, normalizedFormat, quality, cookiePath
     forceOverwrites: true,
     output: outputTemplate,
     userAgent: DEFAULT_USER_AGENT,
-    // Force the web player so all formats are available.
-    // Without this, cookies can cause yt-dlp to use the TV/Android client
-    // which has fewer formats and causes "format not available" errors.
+    // Use multiple player clients so formats are always available
     extractorArgs: "youtube:player_client=web,default,ios",
   };
 
@@ -398,4 +446,4 @@ export default async function handler(req, res) {
   } finally {
     await safeRm(tempDir);
   }
-}
+}g
